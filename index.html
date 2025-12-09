@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Label Generator PWA</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#2563eb" />
+  
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icon-192.png">
+
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;background:#f8fafc;color:#0b1220}
+    .card{max-width:760px;margin:0 auto;background:#fff;padding:18px;border-radius:12px;box-shadow:0 8px 30px rgba(2,6,23,.06)}
+    h1{margin:0 0 8px;font-size:20px}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:10px}
+    label{font-size:13px;color:#374151}
+    input[type="number"]{padding:10px;border-radius:8px;border:1px solid #e6edf3;width:180px}
+    button{padding:10px 16px;border-radius:10px;border:0;background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .note{font-size:13px;color:#475569;margin-top:8px}
+    .hidden-renderer{position:fixed;left:-9999px;top:-9999px;opacity:0;pointer-events:none}
+    #status { margin-top:10px; font-size:13px; color:#374151; }
+  </style>
+</head>
+<body>
+  <div class="card" role="main">
+    <h1>2 × 2 Label Generator (PWA)</h1>
+    <p class="note">Enter values and click <strong>Generate PDF</strong>.<br>
+    <strong>QR Code:</strong> Contains only Serial Number.<br>
+    <strong>Label Text:</strong> Shows Price, Item Code, and Serial.</p>
+
+    <div class="row" style="margin-top:14px;">
+      <div>
+        <label for="price">Purchase Price</label><br>
+        <input id="price" type="number" min="0" step="0.01" placeholder="e.g. 250" />
+      </div>
+
+      <div>
+        <label for="qty">Quantity</label><br>
+        <input id="qty" type="number" min="1" max="500" value="1" />
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <button id="generatePdf">Generate PDF</button>
+        <div id="status" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <p class="note" style="margin-top:12px;">Note: Quantity &gt; 200 may crash or hang some browsers.</p>
+  </div>
+
+  <div id="labelRenderer" class="hidden-renderer" aria-hidden="true"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <script>
+  // --- PWA SERVICE WORKER REGISTRATION ---
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js')
+        .then(() => console.log('Service Worker Registered'))
+        .catch(err => console.log('SW Registration Failed:', err));
+    });
+  }
+
+  (function(){
+    // Digit->Letter mapping A=1,B=2,...,I=9,J=0
+    const digitToLetter = { '0':'J','1':'A','2':'B','3':'C','4':'D','5':'E','6':'F','7':'G','8':'H','9':'I' };
+
+    const priceInput = document.getElementById('price');
+    const qtyInput = document.getElementById('qty');
+    const generateBtn = document.getElementById('generatePdf');
+    const statusEl = document.getElementById('status');
+    const labelRenderer = document.getElementById('labelRenderer');
+
+    const MAX_SAFE = 200;
+
+    function toItemCode(price){
+      const digits = String(price).replace(/\D/g,'');
+      if(!digits) return '';
+      return digits.split('').map(d => digitToLetter[d] || '?').join('');
+    }
+
+    function formatCurrency(n){
+      const num = Number(n) || 0;
+      return '₹' + num.toFixed(2);
+    }
+
+    // 8-Digit Random Serial
+    function makeSerial() {
+      const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      let result = '';
+      for (let i = 0; i < 8; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    }
+
+    function createHiddenLabelDOM({ purchasePrice, itemCode, sellingPrice, serial, idx }){
+      const wrapper = document.createElement('div');
+      wrapper.style.width = '2in';
+      wrapper.style.height = '2in';
+      wrapper.style.boxSizing = 'border-box';
+      wrapper.style.padding = '8px';
+      wrapper.style.display = 'flex';
+      wrapper.style.flexDirection = 'column';
+      wrapper.style.alignItems = 'center';
+      wrapper.style.justifyContent = 'space-between';
+      wrapper.style.background = '#ffffff';
+      wrapper.style.color = '#0b1220';
+      wrapper.style.borderRadius = '6px';
+      wrapper.style.fontFamily = 'Inter, system-ui, -apple-system, \"Segoe UI\", Roboto, Arial';
+      wrapper.style.fontSize = '12px';
+
+      // 1. QR Code
+      const qrWrap = document.createElement('div');
+      qrWrap.id = 'qr-' + idx;
+      qrWrap.style.width = '0.9in';
+      qrWrap.style.height = '0.9in';
+      wrapper.appendChild(qrWrap);
+
+      // 2. Serial Text
+      const serialEl = document.createElement('div');
+      serialEl.textContent = serial;
+      serialEl.style.fontSize = '12px';
+      serialEl.style.fontWeight = '600';
+      serialEl.style.color = '#334155';
+      serialEl.style.marginTop = '6px';
+      serialEl.style.wordBreak = 'break-all';
+      wrapper.appendChild(serialEl);
+
+      // 3. Item Code
+      const codeEl = document.createElement('div');
+      codeEl.textContent = itemCode || '-';
+      codeEl.style.fontWeight = '700';
+      codeEl.style.letterSpacing = '0.6px';
+      wrapper.appendChild(codeEl);
+
+      // 4. Selling Price
+      const priceEl = document.createElement('div');
+      priceEl.innerHTML = 'Selling Price: <b>' + formatCurrency(sellingPrice) + '</b>';
+      priceEl.style.marginTop = '4px';
+      wrapper.appendChild(priceEl);
+
+      // QR Generation
+      new QRCode(qrWrap, {
+        text: serial, // QR contains ONLY the serial now
+        width: Math.round(0.9 * 96),
+        height: Math.round(0.9 * 96),
+        correctLevel: QRCode.CorrectLevel.H
+      });
+
+      return wrapper;
+    }
+
+    async function generatePdf(){
+      const purchasePrice = priceInput.value;
+      let qty = parseInt(qtyInput.value, 10);
+
+      if(purchasePrice === '' || isNaN(Number(purchasePrice)) || Number(purchasePrice) < 0){
+        alert('Please enter a valid Purchase Price.');
+        return;
+      }
+      if(isNaN(qty) || qty < 1){
+        alert('Please enter a valid Quantity.');
+        return;
+      }
+      if(qty > MAX_SAFE){
+        if(!confirm(`Quantity (${qty}) exceeds recommended safe limit of ${MAX_SAFE}. Large PDFs can crash your browser. Continue?`)) return;
+        qty = Math.min(qty, 500);
+      }
+
+      generateBtn.disabled = true;
+      statusEl.textContent = 'Starting PDF generation...';
+
+      const itemCode = toItemCode(purchasePrice);
+      const sellingPrice = Number(purchasePrice) * 1.5;
+
+      if(!window.jspdf || !window.jspdf.jsPDF){
+        alert('jsPDF not loaded correctly. Please check internet connection or CDN.');
+        generateBtn.disabled = false;
+        return;
+      }
+      const pdf = new window.jspdf.jsPDF({ unit: 'in', format: [2, 2] });
+
+      for(let i=1;i<=qty;i++){
+        statusEl.textContent = `Rendering label ${i} of ${qty}...`;
+
+        labelRenderer.innerHTML = '';
+        const serial = makeSerial(); 
+        const labelDOM = createHiddenLabelDOM({ purchasePrice, itemCode, sellingPrice, serial, idx: i });
+        labelRenderer.appendChild(labelDOM);
+
+        await new Promise(r => setTimeout(r, 80));
+
+        try {
+          const canvas = await html2canvas(labelDOM, { backgroundColor: null, scale: 3, useCORS: true });
+          const imgData = canvas.toDataURL('image/png');
+          pdf.addImage(imgData, 'PNG', 0, 0, 2, 2);
+        } catch (err) {
+          console.error('html2canvas error', err);
+          alert('Rendering failed on label ' + i + '. See console for details.');
+          generateBtn.disabled = false;
+          statusEl.textContent = 'Error occurred.';
+          return;
+        }
+
+        if(i < qty) pdf.addPage([2,2]);
+      }
+
+      const now = new Date();
+      const filename = `labels_${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}.pdf`;
+      pdf.save(filename);
+
+      statusEl.textContent = `Done — downloaded ${filename}`;
+      generateBtn.disabled = false;
+    }
+
+    generateBtn.addEventListener('click', generatePdf);
+  })();
+  </script>
+</body>
+</html>
